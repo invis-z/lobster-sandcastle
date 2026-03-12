@@ -1,0 +1,97 @@
+name: Parse Dockerfile Dependencies
+description: Parses COPY/ADD sources from Dockerfiles and updates per-image dependency cache files
+
+inputs:
+  dockerfiles:
+    required: true
+    description: JSON array of objects, each object must include path and output
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Dockerfile Parser
+      id: setup-parser
+      uses: invis-z/lobster-sandcastle/.github/actions/setup-dockerfile-parser@active
+
+    - name: Parse and Update COPY/ADD Dependencies
+      shell: bash
+      env:
+        DOCKERFILES_JSON: ${{ inputs.dockerfiles }}
+        PARSER_BIN: ${{ steps.setup-parser.outputs.parser_bin }}
+      run: |
+        set -euo pipefail
+        
+        echo "=== Parse and Update COPY/ADD Dependencies ==="
+        echo "DOCKERFILES_JSON: $DOCKERFILES_JSON"
+
+        if [ -z "$DOCKERFILES_JSON" ]; then
+          echo "ERROR: dockerfiles input is empty; expected JSON array (use [] for no files)." >&2
+          exit 1
+        fi
+
+        if ! jq -e 'type == "array"' <<< "$DOCKERFILES_JSON" > /dev/null; then
+          echo "ERROR: dockerfiles input must be a JSON array." >&2
+          exit 1
+        fi
+
+        DOCKERFILE_COUNT=$(jq 'length' <<< "$DOCKERFILES_JSON")
+        echo "Processing $DOCKERFILE_COUNT Dockerfile(s)"
+        
+        if [ "$DOCKERFILE_COUNT" -eq 0 ]; then
+          echo "✓ No Dockerfiles to parse, skipping."
+          exit 0
+        fi
+
+        while IFS= read -r dockerfile; do
+          [ -z "$dockerfile" ] && continue
+          echo ""
+          echo "Processing Dockerfile entry: $dockerfile"
+          dockerfile_path=$(jq -r '.path // empty' <<< "$dockerfile")
+          output_path=$(jq -r '.output // empty' <<< "$dockerfile")
+
+          if [ -z "$dockerfile_path" ] || [ -z "$output_path" ]; then
+            echo "ERROR: Each dockerfiles item must include non-empty path and output fields: $dockerfile" >&2
+            exit 1
+          fi
+
+          if [ ! -f "$dockerfile_path" ]; then
+            echo "ERROR: Dockerfile path does not exist: $dockerfile_path" >&2
+            exit 1
+          fi
+
+          echo "  Input path: $dockerfile_path"
+          echo "  Output path: $output_path"
+          echo "  Parsing COPY/ADD instructions..."
+
+          if ! COPY_SOURCES_JSON=$("$PARSER_BIN" < "$dockerfile_path" | jq -c '
+            if type != "array" then
+              error("parser output is not a JSON array")
+            else
+              [ .[]
+                | select(.value == "COPY" or .value == "ADD")
+                | select((((.flags // []) | map(test("^--from(=|$)")) | any) | not))
+                | [ .next? | recurse(if (type == "object" and has("next")) then .next else empty end) | .value? ]
+                | if length > 1 then .[0:-1][] else empty end
+              ]
+              | map(sub("^\\./"; "") | sub("/+$"; ""))
+              | map(select(length > 0))
+              | unique
+            end
+          '); then
+            echo "ERROR: jq COPY/ADD extraction failed for: $dockerfile_path" >&2
+            exit 1
+          fi
+          
+          SOURCE_COUNT=$(echo "$COPY_SOURCES_JSON" | jq 'length')
+          echo "  Found $SOURCE_COUNT COPY/ADD source(s)"
+          if [ "$SOURCE_COUNT" -gt 0 ]; then
+            echo "$COPY_SOURCES_JSON" | jq -r '.[]' | sed 's/^/    /'
+          fi
+          
+          mkdir -p "$(dirname "$output_path")"
+          printf '%s\n' "$COPY_SOURCES_JSON" > "$output_path"
+          echo "  ✓ Updated dependency file: $output_path"
+        done < <(jq -c '.[]' <<< "$DOCKERFILES_JSON")
+        
+        echo ""
+        echo "✓ Parsing complete"

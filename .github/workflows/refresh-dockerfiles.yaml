@@ -1,0 +1,350 @@
+name: Refresh Dockerfiles (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      local_version:
+        required: false
+        type: string
+    outputs:
+      changed:
+        description: 'Whether any Dockerfiles were changed'
+        value: ${{ jobs.refresh-dockerfiles.outputs.changed }}
+      commit_sha:
+        description: 'SHA of the commit created'
+        value: ${{ jobs.refresh-dockerfiles.outputs.commit_sha }}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-dockerfiles:
+    name: Refresh Dockerfiles
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.set-changed.outputs.changed }}
+      commit_sha: ${{ steps.commit-and-push.outputs.commit_sha }}
+    steps:
+      - name: Checkout Local
+        uses: actions/checkout@v6
+        with:
+          path: local
+
+      - name: Validate Configuration
+        env:
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+        run: |
+          echo "=== Validating Configuration ==="
+          echo "UPSTREAM_REPO: $UPSTREAM_REPO"
+          
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "ERROR: UPSTREAM_REPO repository variable is required." >&2
+            exit 1
+          fi
+
+          if ! printf '%s' "$UPSTREAM_REPO" | grep -Eq '^[^/]+/[^/]+$'; then
+            echo "ERROR: UPSTREAM_REPO must be in owner/repo format: $UPSTREAM_REPO" >&2
+            exit 1
+          fi
+          
+          echo "✓ Configuration validation passed"
+
+      - name: Get Changed Files
+        id: get-changed-files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          VERSION: ${{ inputs.version }}
+          LOCAL_VERSION: ${{ inputs.local_version }}
+        run: |
+          echo "=== Getting Changed Files ==="
+          echo "UPSTREAM_REPO: $UPSTREAM_REPO"
+          echo "VERSION: $VERSION"
+          echo "LOCAL_VERSION: $LOCAL_VERSION"
+          
+          CHANGED_FILES_JSON='[]'
+          if [ -n "$LOCAL_VERSION" ] && [ "$LOCAL_VERSION" != "null" ]; then
+            echo "Comparing $LOCAL_VERSION...$VERSION in $UPSTREAM_REPO"
+            CHANGED_FILES_JSON=$(gh api \
+              "/repos/$UPSTREAM_REPO/compare/${LOCAL_VERSION}...${VERSION}" \
+              --jq '[.files[].filename]')
+            echo "Changed files count: $(echo "$CHANGED_FILES_JSON" | jq 'length')"
+            echo "Changed files: $(echo "$CHANGED_FILES_JSON" | jq -r '.[]')"
+          else
+            echo "No local version found, treating all files as changed."
+          fi
+
+          echo "changed_files_json=$CHANGED_FILES_JSON" >> "$GITHUB_OUTPUT"
+          echo "✓ Changed files collected"
+
+      - name: Compare and Update Dockerfiles
+        id: collect
+        uses: invis-z/lobster-sandcastle/.github/actions/compare-dockerfiles@active
+        with:
+          images: '["sandbox", "sandbox-browser", "sandbox-common"]'
+          upstream_repo: ${{ vars.UPSTREAM_REPO }}
+          version: ${{ inputs.version }}
+          changed_files_json: ${{ steps.get-changed-files.outputs.changed_files_json }}
+      - name: Generate COPY/ADD Check List
+        id: copy-check-list
+        env:
+          DOCKERFILE_CHANGED_IMAGES_JSON: ${{ steps.collect.outputs.dockerfile_changed_images }}
+        run: |
+          echo "=== Generating COPY/ADD Check List ==="
+          echo "DOCKERFILE_CHANGED_IMAGES_JSON: $DOCKERFILE_CHANGED_IMAGES_JSON"
+
+          if [ -z "$DOCKERFILE_CHANGED_IMAGES_JSON" ]; then
+            echo "ERROR: collect.outputs.dockerfile_changed_images is empty." >&2
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON" > /dev/null; then
+            echo "ERROR: collect.outputs.dockerfile_changed_images must be a JSON array." >&2
+            exit 1
+          fi
+          
+          COPY_CHECK_IMAGES='[]'
+          DOCKERFILES_JSON='[]'
+          
+          for image in sandbox sandbox-browser sandbox-common; do
+            echo ""
+            echo "Processing image: $image"
+            LOCAL_FILE="local/${image}/Dockerfile"
+            CACHE_FILE="local/${image}/image-build-dependency-paths.json"
+            
+            echo "  LOCAL_FILE: $LOCAL_FILE (exists: $([ -f "$LOCAL_FILE" ] && echo 'yes' || echo 'no'))"
+            echo "  CACHE_FILE: $CACHE_FILE (exists: $([ -f "$CACHE_FILE" ] && echo 'yes' || echo 'no'))"
+            
+            # Dockerfile changed images should also be re-parsed so cache stays in sync.
+            DOCKERFILE_CHANGED=$(jq -r --arg image "$image" 'any(.[]; . == $image)' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")
+            
+            if [ ! -f "$LOCAL_FILE" ]; then
+              echo "  → Skipping: Dockerfile doesn't exist"
+              continue
+            fi
+
+            HAS_COPY_ADD="false"
+            if grep -qE '^\s*(COPY|ADD)\s' "$LOCAL_FILE"; then
+              HAS_COPY_ADD="true"
+            fi
+            
+            # Re-parse on direct Dockerfile changes, or bootstrap missing cache.
+            if [ "$HAS_COPY_ADD" = "true" ] && { [ "$DOCKERFILE_CHANGED" = "true" ] || [ ! -f "$CACHE_FILE" ]; }; then
+              if [ "$DOCKERFILE_CHANGED" = "true" ]; then
+                echo "  → Adding to check list: Dockerfile changed"
+              else
+                echo "  → Adding to check list: Has COPY/ADD and no cache"
+              fi
+              COPY_CHECK_IMAGES=$(jq -c ". += [\"$image\"]" <<< "$COPY_CHECK_IMAGES")
+              DOCKERFILES_JSON=$(jq -c \
+                --arg path "$LOCAL_FILE" \
+                --arg output "$CACHE_FILE" \
+                '. + [{"path": $path, "output": $output}]' <<< "$DOCKERFILES_JSON")
+            elif [ -f "$CACHE_FILE" ] && [ ! -s "$CACHE_FILE" ]; then
+              echo "  → Removing empty cache file"
+              rm "$CACHE_FILE"
+            else
+              echo "  → Skipping: Has cache or no COPY/ADD instructions"
+            fi
+          done
+          
+          echo ""
+          echo "COPY_CHECK_IMAGES: $COPY_CHECK_IMAGES"
+          echo "DOCKERFILES_JSON: $DOCKERFILES_JSON"
+          echo "images=$COPY_CHECK_IMAGES" >> "$GITHUB_OUTPUT"
+          echo "dockerfiles=$DOCKERFILES_JSON" >> "$GITHUB_OUTPUT"
+          echo "✓ COPY/ADD check list generated"
+      - name: Parse and Update COPY/ADD Dependencies
+        id: parse-copy-add
+        uses: invis-z/lobster-sandcastle/.github/actions/parse-dockerfile-deps@active
+        with:
+          dockerfiles: ${{ steps.copy-check-list.outputs.dockerfiles }}
+
+      - name: Collect Images with Changed Dependencies
+        id: collect-changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          VERSION: ${{ inputs.version }}
+          CHANGED_FILES_JSON: ${{ steps.get-changed-files.outputs.changed_files_json }}
+          COPY_CHECK_IMAGES: ${{ steps.copy-check-list.outputs.images }}
+        run: |
+          echo "=== Collecting Images with Changed Dependencies ==="
+          echo "UPSTREAM_REPO: $UPSTREAM_REPO"
+          echo "VERSION: $VERSION"
+          echo "COPY_CHECK_IMAGES: $COPY_CHECK_IMAGES"
+          echo "CHANGED_FILES_JSON: $CHANGED_FILES_JSON"
+          
+          CHANGED_IMAGES=""
+          
+          # Check COPY/ADD dependencies only for images in the check list
+          while IFS= read -r image; do
+            [ -z "$image" ] && continue
+            
+            echo ""
+            echo "Checking dependencies for image: $image"
+            CACHE_FILE="local/${image}/image-build-dependency-paths.json"
+            
+            if [ ! -f "$CACHE_FILE" ]; then
+              echo "  No cached COPY/ADD sources to check."
+              continue
+            fi
+
+            COPY_SOURCES=$(jq -r '.[]?' "$CACHE_FILE")
+            if [ -z "$COPY_SOURCES" ]; then
+              echo "  No cached COPY/ADD sources to check."
+              continue
+            fi
+            
+            echo "  Cached sources:"
+            echo "$COPY_SOURCES" | sed 's/^/    /'
+
+            for src in $COPY_SOURCES; do
+              [ -z "$src" ] && continue
+              echo "  Checking source: $src"
+              NORM_SRC=${src#./}
+              NORM_SRC=${NORM_SRC%/}
+              echo "    Normalized source: $NORM_SRC"
+              
+              FOUND=$(jq -r --arg path "$NORM_SRC" 'any(.[]; (. | sub("^\\./"; "") | sub("/$"; "")) as $f | $f == $path or ($f | startswith($path + "/")))' <<< "$CHANGED_FILES_JSON")
+              echo "    Found in changed files: $FOUND"
+
+              if [ "$FOUND" = "true" ]; then
+                echo "    ✓ Dependency '$src' changed between releases, marking as changed."
+                CHANGED_IMAGES="${CHANGED_IMAGES}${image}"$'\n'
+                break
+              fi
+            done
+          done <<< "$(jq -r '.[]' <<< "$COPY_CHECK_IMAGES")"
+
+          echo ""
+          echo "=== Applying Dockerfile Updates for Changed Images ==="
+          # Apply Dockerfile updates for images changed via COPY/ADD dependencies.
+          while IFS= read -r image; do
+            [ -z "$image" ] && continue
+            echo "Updating Dockerfile for image: $image"
+            DOCKERFILE="Dockerfile.${image}"
+            UPSTREAM_FILE="upstream/${DOCKERFILE}"
+            LOCAL_FILE="local/${image}/Dockerfile"
+            
+            echo "  UPSTREAM_FILE: $UPSTREAM_FILE"
+            echo "  LOCAL_FILE: $LOCAL_FILE"
+
+            if [ ! -f "$UPSTREAM_FILE" ]; then
+              echo "  Downloading from upstream..."
+              gh api \
+                -H "Accept: application/vnd.github.v3.raw" \
+                "/repos/$UPSTREAM_REPO/contents/${DOCKERFILE}?ref=$VERSION" \
+                > "$UPSTREAM_FILE"
+              echo "  ✓ Downloaded"
+            else
+              echo "  Using cached upstream file"
+            fi
+
+            mkdir -p "local/${image}"
+            cp "$UPSTREAM_FILE" "$LOCAL_FILE"
+            echo "  ✓ Copied to local"
+          done <<< "$CHANGED_IMAGES"
+
+          echo ""
+          echo "Final CHANGED_IMAGES output:"
+          echo "$CHANGED_IMAGES" | sed 's/^/  /'
+          {
+            echo "copy_changed_images<<EOF"
+            printf '%s\n' "$CHANGED_IMAGES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "✓ Changed dependencies collected"
+
+      - name: Combine Changed Image Lists
+        id: combine-changed
+        env:
+          DOCKERFILE_CHANGED_IMAGES_JSON: ${{ steps.collect.outputs.dockerfile_changed_images }}
+          COPY_CHANGED_IMAGES: ${{ steps.collect-changed.outputs.copy_changed_images }}
+        run: |
+          echo "=== Combining Changed Image Lists ==="
+          echo "DOCKERFILE_CHANGED_IMAGES_JSON: $DOCKERFILE_CHANGED_IMAGES_JSON"
+          echo "COPY_CHANGED_IMAGES:"
+          echo "$COPY_CHANGED_IMAGES" | sed 's/^/  /'
+
+          if [ -z "$DOCKERFILE_CHANGED_IMAGES_JSON" ]; then
+            echo "ERROR: collect.outputs.dockerfile_changed_images is empty." >&2
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON" > /dev/null; then
+            echo "ERROR: collect.outputs.dockerfile_changed_images must be a JSON array." >&2
+            exit 1
+          fi
+          
+          ALL_CHANGED_IMAGES=$(printf '%s\n%s\n' "$(jq -r '.[]?' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")" "$COPY_CHANGED_IMAGES" | awk 'NF' | sort -u)
+
+          echo ""
+          echo "ALL_CHANGED_IMAGES (deduplicated):"
+          echo "$ALL_CHANGED_IMAGES" | sed 's/^/  /'
+          {
+            echo "all_changed_images<<EOF"
+            printf '%s\n' "$ALL_CHANGED_IMAGES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$ALL_CHANGED_IMAGES" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "✓ There are changes to commit"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected"
+          fi
+
+      - name: Commit and Push
+        id: commit-and-push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: invis-z/lobster-sandcastle/.github/actions/api-signed-commit@active
+        with:
+          commit_message: Refresh Dockerfiles from upstream ${{ inputs.version }}
+          repository: ${{ github.repository }}
+          repo_dir: local
+          ref: heads/active
+          mode: graphql
+
+      - name: Create Release
+        if: steps.commit-and-push.outputs.committed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== Creating Release ==="
+          echo "VERSION: ${{ inputs.version }}"
+          echo "REPOSITORY: ${{ github.repository }}"
+          
+          if gh release view "${{ inputs.version }}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "⚠ Release ${{ inputs.version }} already exists, skipping creation"
+            exit 0
+          fi
+
+          echo "Creating new release..."
+          gh release create "${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ steps.commit-and-push.outputs.commit_sha }}" \
+            --title "${{ inputs.version }}" \
+            --notes "Synced from upstream ${{ inputs.version }}" \
+            --latest
+          
+          echo "✓ Release created successfully"
+
+      - name: Set Changed Output
+        id: set-changed
+        run: |
+          CHANGED="${{ steps.combine-changed.outputs.changed }}"
+          echo "=== Workflow Result ==="
+          echo "changed=$CHANGED"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          
+          if [ "$CHANGED" = "true" ]; then
+            echo "✓ Dockerfiles were updated"
+          else
+            echo "✓ No Dockerfile updates needed"
+          fi

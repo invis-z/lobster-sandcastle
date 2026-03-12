@@ -1,0 +1,203 @@
+name: Build Release Docker
+
+on:
+  push:
+    branches:
+      - active
+    paths:
+      - 'sandbox/**'
+      - 'sandbox-browser/**'
+      - 'sandbox-common/**'
+      - '.github/workflows/build.yaml'
+  workflow_run:
+    workflows:
+      - Dependabot Auto-Merge
+    types:
+      - completed
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: true
+        type: string
+      commit:
+        description: 'Commit SHA to build (defaults to latest in active branch)'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  decide:
+    name: Decide Build Context
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      local_ref: ${{ steps.decide.outputs.local_ref }}
+    steps:
+      - name: Resolve build trigger context
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "event_name=${{ github.event_name }}"
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "workflow_run.conclusion=${{ github.event.workflow_run.conclusion }}"
+            echo "workflow_run.head_branch=${{ github.event.workflow_run.head_branch }}"
+
+            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+              echo "Dependabot Auto-Merge did not succeed, skipping build."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            ACTIVE_SHA=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${{ github.repository }}/branches/active" \
+              --jq '.commit.sha')
+
+            if [ -z "$ACTIVE_SHA" ] || [ "$ACTIVE_SHA" = "null" ]; then
+              echo "ERROR: could not resolve active branch head SHA." >&2
+              exit 1
+            fi
+
+            echo "Using active branch SHA after auto-merge: $ACTIVE_SHA"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "local_ref=$ACTIVE_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Standard trigger path, using current SHA: $GITHUB_SHA"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "local_ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+  pre-build:
+    name: Determine Version
+    if: ${{ needs.decide.outputs.should_build == 'true' }}
+    needs: decide
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - name: Get Version
+        id: get-version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Fetching latest release from ${{ github.repository }}"
+            RELEASE_INFO=$(gh release list \
+              --repo "${{ github.repository }}" \
+              --exclude-drafts \
+              --exclude-pre-releases \
+              --limit 1 \
+              --json tagName)
+            RELEASE=$(echo "$RELEASE_INFO" | jq -r '.[0].tagName')
+
+            if [ -z "$RELEASE" ] || [ "$RELEASE" = "null" ]; then
+              echo "ERROR: failed to resolve local release tag." >&2
+              exit 1
+            fi
+
+            echo "version=$RELEASE" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-sandbox:
+    name: Build Sandbox
+    if: ${{ needs.decide.outputs.should_build == 'true' }}
+    needs: [decide, pre-build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout Local
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.commit != '' && inputs.commit || needs.decide.outputs.local_ref }}
+          path: local
+      - name: Checkout Source Repo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.UPSTREAM_REPO }}
+          ref: ${{ needs.pre-build.outputs.version }}
+          path: upstream
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream
+          file: local/sandbox/Dockerfile
+          platforms: linux/amd64, linux/arm64
+          push: true
+          cache-to: type=gha,mode=max
+          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:bookworm-slim
+
+      - name: Build and push Sandbox Common
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream
+          file: local/sandbox-common/Dockerfile
+          platforms: linux/amd64, linux/arm64
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:${{ needs.pre-build.outputs.version }}
+          push: true
+          cache-from: type=gha
+          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-common:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-common:bookworm-slim
+
+  build-sandbox-browser:
+    name: Build Sandbox Browser
+    if: ${{ needs.decide.outputs.should_build == 'true' }}
+    needs: [decide, pre-build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout Local
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.commit != '' && inputs.commit || needs.decide.outputs.local_ref }}
+          path: local
+      - name: Checkout Source Repo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.UPSTREAM_REPO }}
+          ref: ${{ needs.pre-build.outputs.version }}
+          path: upstream
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream
+          file: local/sandbox-browser/Dockerfile
+          platforms: linux/amd64, linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-browser:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-browser:bookworm-slim

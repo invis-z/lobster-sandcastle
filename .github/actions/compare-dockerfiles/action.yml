@@ -1,0 +1,241 @@
+name: Compare and Update Dockerfiles
+description: Compares local and upstream Dockerfiles, handling FROM digest preservation and collecting dependencies for parsing
+
+inputs:
+  images:
+    required: true
+    description: 'JSON array of image names to process'
+  upstream_repo:
+    required: true
+    description: 'Upstream repository in owner/repo format'
+  version:
+    required: true
+    description: 'Upstream version/tag to compare against'
+  changed_files_json:
+    required: true
+    description: 'JSON array of changed files from upstream'
+
+outputs:
+  dockerfile_changed_images:
+    description: 'JSON array of images with changed Dockerfiles'
+    value: ${{ steps.compare.outputs.dockerfile_changed_images }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Dockerfile Parser
+      id: setup-parser
+      uses: invis-z/lobster-sandcastle/.github/actions/setup-dockerfile-parser@active
+
+    - name: Compare Dockerfiles and Collect Updates
+      id: compare
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        IMAGES: ${{ inputs.images }}
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        VERSION: ${{ inputs.version }}
+        CHANGED_FILES_JSON: ${{ inputs.changed_files_json }}
+        PARSER_BIN: ${{ steps.setup-parser.outputs.parser_bin }}
+      run: |
+        set -euo pipefail
+
+        echo "=== Compare Dockerfiles and Collect Updates ==="
+        echo "UPSTREAM_REPO: $UPSTREAM_REPO"
+        echo "VERSION: $VERSION"
+        echo "IMAGES: $IMAGES"
+        echo "CHANGED_FILES_JSON: $CHANGED_FILES_JSON"
+
+        if [ -z "$IMAGES" ]; then
+          echo "ERROR: inputs.images is empty." >&2
+          exit 1
+        fi
+
+        if ! jq -e 'type == "array"' <<< "$IMAGES" > /dev/null; then
+          echo "ERROR: inputs.images must be a JSON array." >&2
+          exit 1
+        fi
+
+        if [ -z "$CHANGED_FILES_JSON" ]; then
+          echo "ERROR: inputs.changed_files_json is empty." >&2
+          exit 1
+        fi
+
+        if ! jq -e 'type == "array"' <<< "$CHANGED_FILES_JSON" > /dev/null; then
+          echo "ERROR: inputs.changed_files_json must be a JSON array." >&2
+          exit 1
+        fi
+        
+        mkdir -p upstream
+        DOCKERFILE_CHANGED_IMAGES_JSON='[]'
+        HAS_CHANGED_LIST=$(jq -r 'length > 0' <<< "$CHANGED_FILES_JSON")
+        echo "HAS_CHANGED_LIST: $HAS_CHANGED_LIST"
+
+        while IFS= read -r image; do
+          [ -z "$image" ] && continue
+          echo ""
+          echo "Processing image: $image"
+          DOCKERFILE="Dockerfile.${image}"
+          LOCAL_FILE="local/${image}/Dockerfile"
+          UPSTREAM_FILE="upstream/${DOCKERFILE}"
+          CACHE_FILE="local/${image}/image-build-dependency-paths.json"
+          DIFF_FILE=""
+          NON_FROM_FILE=""
+          REMOVED_FROM_ORIG=""
+          ADDED_FROM_ORIG=""
+          echo "  DOCKERFILE: $DOCKERFILE"
+          echo "  LOCAL_FILE: $LOCAL_FILE (exists: $([ -f "$LOCAL_FILE" ] && echo 'yes' || echo 'no'))"
+          echo "  UPSTREAM_FILE: $UPSTREAM_FILE"
+          DOCKERFILE_CHANGED=$(jq -r --arg path "$DOCKERFILE" 'any(.[]; . == $path)' <<< "$CHANGED_FILES_JSON")
+          echo "  DOCKERFILE_CHANGED: $DOCKERFILE_CHANGED"
+
+          if [ "$HAS_CHANGED_LIST" = "false" ] || [ "$DOCKERFILE_CHANGED" = "true" ]; then
+            echo "  → Need to fetch and compare (no changed list or Dockerfile changed)"
+            gh api \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "/repos/$UPSTREAM_REPO/contents/${DOCKERFILE}?ref=$VERSION" \
+              > "$UPSTREAM_FILE"
+            echo "  ✓ Downloaded upstream file"
+
+            if [ -f "$LOCAL_FILE" ]; then
+              echo "  → Comparing local vs upstream"
+              DIFF_FILE=$(mktemp)
+              if ! diff -u "$LOCAL_FILE" "$UPSTREAM_FILE" > "$DIFF_FILE"; then
+                echo "  → Differences found, analyzing..."
+                NON_FROM_FILE=$(mktemp)
+                REMOVED_FROM_ORIG=$(mktemp)
+                ADDED_FROM_ORIG=$(mktemp)
+
+                awk -v non_from="$NON_FROM_FILE" \
+                    -v removed_orig="$REMOVED_FROM_ORIG" \
+                    -v added_orig="$ADDED_FROM_ORIG" '
+                  /^\+\+\+|^---/ { next }
+                  /^[+-]/ {
+                    sign = substr($0, 1, 1)
+                    line = substr($0, 2)
+
+                    if (line ~ /^[[:space:]]*FROM([[:space:]]|$)/) {
+                      print line >> (sign == "-" ? removed_orig : added_orig)
+                    } else {
+                      print $0 >> non_from
+                    }
+                  }
+                ' "$DIFF_FILE"
+
+                FROM_EQUIVALENT="false"
+                if [ ! -s "$NON_FROM_FILE" ]; then
+                  LOCAL_FROM_JSON=$(
+                    "$PARSER_BIN" < "$LOCAL_FILE" | jq -c '
+                      [ .[]
+                        | select((.value | ascii_downcase) == "from")
+                        | {
+                            flags: ((.flags // []) | sort),
+                            image: ((.next.value // "") | sub("@[A-Za-z][A-Za-z0-9_.+-]*:[A-Za-z0-9_.+=-]+$"; "")),
+                            stage: (
+                              ([.next? | recurse(.next?) | .value?] as $parts
+                               | if (($parts | length) >= 3) and (($parts[-2] | ascii_downcase) == "as")
+                                 then $parts[-1]
+                                 else ""
+                                 end)
+                            )
+                          }
+                      ]
+                    '
+                  )
+
+                  UPSTREAM_FROM_JSON=$(
+                    "$PARSER_BIN" < "$UPSTREAM_FILE" | jq -c '
+                      [ .[]
+                        | select((.value | ascii_downcase) == "from")
+                        | {
+                            flags: ((.flags // []) | sort),
+                            image: ((.next.value // "") | sub("@[A-Za-z][A-Za-z0-9_.+-]*:[A-Za-z0-9_.+=-]+$"; "")),
+                            stage: (
+                              ([.next? | recurse(.next?) | .value?] as $parts
+                               | if (($parts | length) >= 3) and (($parts[-2] | ascii_downcase) == "as")
+                                 then $parts[-1]
+                                 else ""
+                                 end)
+                            )
+                          }
+                      ]
+                    '
+                  )
+
+                  if [ "$LOCAL_FROM_JSON" = "$UPSTREAM_FROM_JSON" ]; then
+                    FROM_EQUIVALENT="true"
+                    echo "    ✓ FROM instructions equivalent (possibly digest difference)"
+                  else
+                    echo "    ✗ FROM instructions differ"
+                  fi
+                fi
+
+                if [ -s "$NON_FROM_FILE" ] || [ "$FROM_EQUIVALENT" != "true" ]; then
+                  echo "  → Marking as changed: non-FROM changes or FROM differs"
+                  DOCKERFILE_CHANGED_IMAGES_JSON=$(jq -c --arg image "$image" '. + [$image]' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")
+
+                  # Keep local digest when the FROM image/tag is unchanged.
+                  CANDIDATE_FILE=$(mktemp)
+                  DIGEST_PATCH_FILE=$(mktemp)
+
+                  cp "$UPSTREAM_FILE" "$CANDIDATE_FILE"
+
+                  if [ "$FROM_EQUIVALENT" = "true" ]; then
+                    paste "$REMOVED_FROM_ORIG" "$ADDED_FROM_ORIG" | while IFS=$'\t' read -r upstream_from local_from; do
+                      [ -z "$upstream_from" ] && continue
+                      [ -z "$local_from" ] && continue
+
+                      TMP_REPLACE_FILE=$(mktemp)
+                      awk -v old_line="$upstream_from" -v new_line="$local_from" '
+                        replaced == 0 && $0 == old_line {
+                          print new_line
+                          replaced = 1
+                          next
+                        }
+                        { print }
+                      ' "$CANDIDATE_FILE" > "$TMP_REPLACE_FILE"
+                      mv "$TMP_REPLACE_FILE" "$CANDIDATE_FILE"
+                    done
+                  fi
+
+                  if ! diff -u "$UPSTREAM_FILE" "$CANDIDATE_FILE" > "$DIGEST_PATCH_FILE"; then
+                    if [ -s "$DIGEST_PATCH_FILE" ]; then
+                      patch -s "$UPSTREAM_FILE" "$DIGEST_PATCH_FILE"
+                    fi
+                  fi
+
+                  rm -f "$CANDIDATE_FILE" "$REMOVED_FROM_ORIG" "$ADDED_FROM_ORIG" "$DIGEST_PATCH_FILE"
+                  mkdir -p "local/${image}"
+                  cp "$UPSTREAM_FILE" "$LOCAL_FILE"
+
+                  rm -f "$DIFF_FILE" "$NON_FROM_FILE" "$REMOVED_FROM_ORIG" "$ADDED_FROM_ORIG"
+                  continue
+                fi
+              fi
+            else
+              echo "  → Local Dockerfile doesn't exist, copying from upstream"
+              DOCKERFILE_CHANGED_IMAGES_JSON=$(jq -c --arg image "$image" '. + [$image]' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")
+              mkdir -p "local/${image}"
+              cp "$UPSTREAM_FILE" "$LOCAL_FILE"
+
+              rm -f "$DIFF_FILE" "$NON_FROM_FILE" "$REMOVED_FROM_ORIG" "$ADDED_FROM_ORIG"
+              continue
+            fi
+          fi
+          
+          echo "  → Skipping: Dockerfile unchanged or no comparison needed"
+
+          rm -f "$DIFF_FILE" "$NON_FROM_FILE" "$REMOVED_FROM_ORIG" "$ADDED_FROM_ORIG"
+        done <<< "$(jq -r '.[]' <<< "$IMAGES")"
+
+        DOCKERFILE_CHANGED_IMAGES_JSON=$(jq -c 'unique' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")
+
+        echo ""
+        echo "=== Final Result ==="
+        echo "DOCKERFILE_CHANGED_IMAGES count: $(jq 'length' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")"
+        if [ "$(jq 'length' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON")" -gt 0 ]; then
+          echo "Changed images:"
+          jq -r '.[]' <<< "$DOCKERFILE_CHANGED_IMAGES_JSON" | sed 's/^/  /'
+        fi
+
+        echo "dockerfile_changed_images=$DOCKERFILE_CHANGED_IMAGES_JSON" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,81 @@
+name: Setup Dockerfile Parser
+description: Downloads and verifies the dockerfile-parser-json binary
+
+outputs:
+  parser_bin:
+    description: Path to the verified parser binary
+    value: ${{ steps.download.outputs.parser_bin }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download and Verify Parser
+      id: download
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        PARSER_REPO="invis-z/dockerfile-parser-json"
+        PARSER_ASSET="dockerfile-parser-json-linux-amd64"
+        PARSER_CACHE_DIR=".parser-cache"
+        PARSER_BIN="${PARSER_CACHE_DIR}/dockerfile-parser-json"
+        
+        mkdir -p "$PARSER_CACHE_DIR"
+
+        RELEASE_JSON=$(gh release view --repo "${PARSER_REPO}" --json assets)
+        PARSER_DIGEST=$(jq -r --arg name "$PARSER_ASSET" '.assets[] | select(.name == $name) | .digest // empty' <<< "$RELEASE_JSON")
+
+        if ! jq -e --arg name "$PARSER_ASSET" '.assets[] | select(.name == $name)' <<< "$RELEASE_JSON" > /dev/null; then
+          echo "Could not find parser asset '${PARSER_ASSET}' in latest release for ${PARSER_REPO}." >&2
+          exit 1
+        fi
+
+        if [ -z "$PARSER_DIGEST" ] || [ "$PARSER_DIGEST" = "null" ]; then
+          echo "No GitHub-provided digest found for asset '${PARSER_ASSET}'." >&2
+          exit 1
+        fi
+
+        DIGEST_ALGO=${PARSER_DIGEST%%:*}
+        DIGEST_EXPECTED=${PARSER_DIGEST#*:}
+
+        # Check if parser already exists
+        if [ -f "$PARSER_BIN" ]; then
+          echo "Parser binary already cached at $PARSER_BIN"
+          echo "parser_bin=$PARSER_BIN" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Downloading parser binary '${PARSER_ASSET}' from ${PARSER_REPO}"
+        TMP_DL_DIR=$(mktemp -d)
+        gh release download \
+          --repo "${PARSER_REPO}" \
+          --pattern "${PARSER_ASSET}" \
+          --dir "$TMP_DL_DIR"
+        mv "${TMP_DL_DIR}/${PARSER_ASSET}" "$PARSER_BIN"
+        rmdir "$TMP_DL_DIR"
+
+        case "$DIGEST_ALGO" in
+          sha256)
+            DIGEST_ACTUAL=$(sha256sum "$PARSER_BIN" | awk '{print $1}')
+            ;;
+          sha512)
+            DIGEST_ACTUAL=$(sha512sum "$PARSER_BIN" | awk '{print $1}')
+            ;;
+          *)
+            echo "Unsupported digest algorithm from GitHub: $DIGEST_ALGO" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ "$DIGEST_ACTUAL" != "$DIGEST_EXPECTED" ]; then
+          echo "Parser binary digest mismatch for ${PARSER_ASSET}." >&2
+          echo "Expected (${DIGEST_ALGO}): $DIGEST_EXPECTED" >&2
+          echo "Actual   (${DIGEST_ALGO}): $DIGEST_ACTUAL" >&2
+          exit 1
+        fi
+
+        echo "Verified parser binary digest (${DIGEST_ALGO})."
+        chmod +x "$PARSER_BIN"
+        echo "parser_bin=$PARSER_BIN" >> "$GITHUB_OUTPUT"

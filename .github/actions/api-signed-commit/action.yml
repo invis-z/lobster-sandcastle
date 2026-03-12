@@ -1,0 +1,258 @@
+name: API Signed Commit
+description: Create and push a signed commit through GitHub Git Database API, including additions, modifications, and deletions
+
+inputs:
+  commit_message:
+    required: true
+    description: Commit message
+  repository:
+    required: true
+    description: Owner/repo, for example org/project
+  repo_dir:
+    required: false
+    default: local
+    description: Relative path to checked out repository
+  ref:
+    required: false
+    default: heads/active
+    description: Git ref to update, for example heads/active
+  mode:
+    required: false
+    default: rest
+    description: Commit mode, either rest or graphql
+
+outputs:
+  committed:
+    description: Whether a commit was created
+    value: ${{ steps.commit.outputs.committed }}
+  commit_sha:
+    description: Created commit SHA
+    value: ${{ steps.commit.outputs.commit_sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Commit via GitHub API
+      id: commit
+      shell: bash
+      env:
+        COMMIT_MSG: ${{ inputs.commit_message }}
+        REPOSITORY: ${{ inputs.repository }}
+        REPO_DIR: ${{ inputs.repo_dir }}
+        REF_NAME: ${{ inputs.ref }}
+        MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        
+        echo "=== Commit via GitHub API ==="
+        echo "MODE: $MODE"
+        echo "REPOSITORY: $REPOSITORY"
+        echo "REF_NAME: $REF_NAME"
+        echo "REPO_DIR: $REPO_DIR"
+
+        cd "$REPO_DIR"
+
+        if [ "$MODE" != "rest" ] && [ "$MODE" != "graphql" ]; then
+          echo "ERROR: Invalid mode: $MODE (expected rest or graphql)" >&2
+          exit 1
+        fi
+
+        BRANCH_NAME=${REF_NAME#heads/}
+        if [ -z "$BRANCH_NAME" ] || [ "$BRANCH_NAME" = "$REF_NAME" ]; then
+          echo "ERROR: Invalid ref for branch commit: $REF_NAME (expected heads/<branch>)" >&2
+          exit 1
+        fi
+        
+        echo "BRANCH_NAME: $BRANCH_NAME"
+
+        echo ""
+        echo "Analyzing changed files..."
+        MODIFIED_OR_ADDED=$( (git diff --name-only; git diff --name-only --cached; git ls-files --others --exclude-standard) | awk 'NF' | sort -u )
+        DELETED_FILES=$( (git diff --name-only --diff-filter=D; git diff --name-only --cached --diff-filter=D) | awk 'NF' | sort -u )
+
+        if [ -n "$DELETED_FILES" ]; then
+          MODIFIED_OR_ADDED=$(awk 'NR==FNR { deleted[$0]=1; next } !($0 in deleted)' \
+            <(printf '%s\n' "$DELETED_FILES") \
+            <(printf '%s\n' "$MODIFIED_OR_ADDED"))
+        fi
+        
+        ADDED_COUNT=$(echo "$MODIFIED_OR_ADDED" | grep -c . || echo 0)
+        DELETED_COUNT=$(echo "$DELETED_FILES" | grep -c . || echo 0)
+        echo "Modified/Added files: $ADDED_COUNT"
+        if [ "$ADDED_COUNT" -gt 0 ]; then
+          echo "$MODIFIED_OR_ADDED" | sed 's/^/  /'
+        fi
+        echo "Deleted files: $DELETED_COUNT"
+        if [ "$DELETED_COUNT" -gt 0 ]; then
+          echo "$DELETED_FILES" | sed 's/^/  /'
+        fi
+
+        if [ -z "$MODIFIED_OR_ADDED" ] && [ -z "$DELETED_FILES" ]; then
+          echo "✓ No changed files to commit."
+          echo "committed=false" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$MODE" = "rest" ]; then
+          echo ""
+          echo "Using REST API mode..."
+          HEAD_SHA=$(gh api "/repos/$REPOSITORY/git/ref/$REF_NAME" --jq '.object.sha')
+          echo "HEAD_SHA: $HEAD_SHA"
+          HEAD_TREE=$(gh api "/repos/$REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha')
+          echo "HEAD_TREE: $HEAD_TREE"
+
+          TREE_ENTRIES="[]"
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            echo "Processing file: $FILE"
+            if [ ! -e "$FILE" ]; then
+              echo "ERROR: Unexpected state: path from modified list does not exist: $FILE" >&2
+              exit 1
+            fi
+            if [ ! -f "$FILE" ]; then
+              echo "ERROR: Unexpected state: path from modified list is not a regular file: $FILE" >&2
+              exit 1
+            fi
+            if [ ! -r "$FILE" ]; then
+              echo "ERROR: Unexpected state: path from modified list is not readable: $FILE" >&2
+              exit 1
+            fi
+
+            echo "  Creating blob..."
+            BLOB_SHA=$(gh api "/repos/$REPOSITORY/git/blobs" \
+              -f "content=$(base64 -w0 < \"$FILE\")" \
+              -f "encoding=base64" \
+              --jq '.sha')
+            echo "  BLOB_SHA: $BLOB_SHA"
+
+            TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq \
+              --arg path "$FILE" \
+              --arg sha "$BLOB_SHA" \
+              '. + [{"path": $path, "mode": "100644", "type": "blob", "sha": $sha}]')
+          done <<< "$MODIFIED_OR_ADDED"
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            echo "Marking for deletion: $FILE"
+
+            TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq \
+              --arg path "$FILE" \
+              '. + [{"path": $path, "mode": "100644", "type": "blob", "sha": null}]')
+          done <<< "$DELETED_FILES"
+
+          echo ""
+          echo "Creating new tree..."
+          NEW_TREE=$(echo "$TREE_ENTRIES" | jq --arg base "$HEAD_TREE" \
+            '{"base_tree": $base, "tree": .}' | \
+            gh api "/repos/$REPOSITORY/git/trees" --input - --jq '.sha')
+          echo "NEW_TREE: $NEW_TREE"
+
+          echo "Creating commit..."
+          NEW_COMMIT=$(jq -n \
+            --arg msg "$COMMIT_MSG" \
+            --arg tree "$NEW_TREE" \
+            --arg parent "$HEAD_SHA" \
+            '{"message": $msg, "tree": $tree, "parents": [$parent]}' | \
+            gh api "/repos/$REPOSITORY/git/commits" --input - --jq '.sha')
+          echo "NEW_COMMIT: $NEW_COMMIT"
+
+          echo "Updating ref..."
+          gh api "/repos/$REPOSITORY/git/refs/$REF_NAME" \
+            -f "sha=$NEW_COMMIT" -f "force=false"
+
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$NEW_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "✓ Commit created via REST API: $NEW_COMMIT"
+          exit 0
+        fi
+
+        echo ""
+        echo "Using GRAPHQL mode..."
+        OWNER=${REPOSITORY%%/*}
+        NAME=${REPOSITORY#*/}
+        if [ -z "$OWNER" ] || [ -z "$NAME" ] || [ "$OWNER" = "$REPOSITORY" ]; then
+          echo "ERROR: Invalid repository format: $REPOSITORY (expected owner/repo)" >&2
+          exit 1
+        fi
+        
+        echo "OWNER: $OWNER"
+        echo "NAME: $NAME"
+
+        QUALIFIED_REF="refs/$REF_NAME"
+        echo "QUALIFIED_REF: $QUALIFIED_REF"
+        echo "Resolving HEAD SHA..."
+        HEAD_SHA=$(jq -n \
+          --arg query 'query($owner:String!,$name:String!,$qualifiedName:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedName){target{... on Commit{oid}}}}}' \
+          --arg owner "$OWNER" \
+          --arg name "$NAME" \
+          --arg qref "$QUALIFIED_REF" \
+          '{"query": $query, "variables": {"owner": $owner, "name": $name, "qualifiedName": $qref}}' | \
+          gh api graphql --input - --jq '.data.repository.ref.target.oid')
+
+        if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
+          echo "ERROR: Unable to resolve HEAD SHA for $QUALIFIED_REF" >&2
+          exit 1
+        fi
+        
+        echo "HEAD_SHA: $HEAD_SHA"
+
+        echo "Building additions array..."
+        ADDITIONS="[]"
+        while IFS= read -r FILE; do
+          [ -z "$FILE" ] && continue
+          echo "Adding file: $FILE"
+          if [ ! -e "$FILE" ]; then
+            echo "ERROR: Unexpected state: path from modified list does not exist: $FILE" >&2
+            exit 1
+          fi
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: Unexpected state: path from modified list is not a regular file: $FILE" >&2
+            exit 1
+          fi
+          if [ ! -r "$FILE" ]; then
+            echo "ERROR: Unexpected state: path from modified list is not readable: $FILE" >&2
+            exit 1
+          fi
+
+          CONTENT=$(base64 -w0 < "$FILE" | jq -Rs .)
+          ADDITIONS=$(echo "$ADDITIONS" | jq --arg path "$FILE" --argjson contents "$CONTENT" '. + [{"path": $path, "contents": $contents}]')
+        done <<< "$MODIFIED_OR_ADDED"
+
+        echo "Building deletions array..."
+        DELETIONS="[]"
+        while IFS= read -r FILE; do
+          [ -z "$FILE" ] && continue
+          echo "Deleting file: $FILE"
+          DELETIONS=$(echo "$DELETIONS" | jq --arg path "$FILE" '. + [{"path": $path}]')
+        done <<< "$DELETED_FILES"
+
+        echo ""
+        echo "Preparing GRAPHQL mutation..."
+        INPUT=$(jq -n \
+          --arg repo "$REPOSITORY" \
+          --arg branch "$BRANCH_NAME" \
+          --arg msg "$COMMIT_MSG" \
+          --arg oid "$HEAD_SHA" \
+          --argjson additions "$ADDITIONS" \
+          --argjson deletions "$DELETIONS" \
+          '{"branch": {"repositoryNameWithOwner": $repo, "branchName": $branch}, "message": {"headline": $msg}, "expectedHeadOid": $oid, "fileChanges": {"additions": $additions, "deletions": $deletions}}')
+
+        echo "Executing GRAPHQL mutation..."
+        RESP=$(jq -n \
+          --arg query 'mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid}}}' \
+          --argjson input "$INPUT" \
+          '{"query": $query, "variables": {"input": $input}}' | \
+          gh api graphql --input -)
+
+        NEW_COMMIT=$(echo "$RESP" | jq -r '.data.createCommitOnBranch.commit.oid // empty')
+        if [ -z "$NEW_COMMIT" ]; then
+          echo "ERROR: GraphQL commit failed." >&2
+          echo "$RESP" | jq -c '.errors // "unknown error"' >&2
+          exit 1
+        fi
+
+        echo "committed=true" >> "$GITHUB_OUTPUT"
+        echo "commit_sha=$NEW_COMMIT" >> "$GITHUB_OUTPUT"
+        echo "✓ Commit created via GRAPHQL: $NEW_COMMIT"
