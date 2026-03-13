@@ -154,20 +154,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          resolve_label_from_file() {
+          echo "=== Resolve image labels (sandbox + common) ==="
+          echo "Parser binary: ${PARSER_BIN}"
+          if [ ! -x "$PARSER_BIN" ]; then
+            echo "ERROR: parser binary is missing or not executable: $PARSER_BIN" >&2
+            exit 1
+          fi
+
+          extract_from_token() {
             local dockerfile="$1"
             local from_line=""
             local from_parsed=""
             local from_ref=""
-            local label=""
 
             from_line=$(grep -Eim1 '^[[:space:]]*FROM[[:space:]]' "$dockerfile" || true)
             if [ -z "$from_line" ]; then
-              echo "latest"
+              echo ""
               return
             fi
+            echo "Matched FROM line: $from_line" >&2
 
             from_parsed=$(printf '%s\n' "$from_line" | "$PARSER_BIN")
+            echo "Parser output: $from_parsed" >&2
             from_ref=$(jq -r '
               first(
                 .[]
@@ -178,6 +186,24 @@ jobs:
               ) // empty
             ' <<< "$from_parsed")
 
+            printf '%s\n' "$from_ref"
+          }
+
+          resolve_label_from_file() {
+            local dockerfile="$1"
+            local from_ref=""
+            local label=""
+
+            echo "--- Resolving label for: $dockerfile" >&2
+
+            from_ref=$(extract_from_token "$dockerfile")
+            echo "Extracted FROM token: ${from_ref:-<empty>}" >&2
+            if [ -z "$from_ref" ]; then
+              echo "No FROM line found, defaulting label to latest" >&2
+              echo "latest"
+              return
+            fi
+
             from_ref="${from_ref%@*}"
             if [[ "$from_ref" == *:* ]]; then
               label="${from_ref##*:}"
@@ -185,11 +211,37 @@ jobs:
               label="latest"
             fi
 
+            echo "Resolved label: $label" >&2
+
             printf '%s\n' "$label"
           }
 
-          SANDBOX_LABEL=$(resolve_label_from_file "local/sandbox/Dockerfile")
+          check_from_uses_arg() {
+            local dockerfile="$1"
+            local expected_arg="$2"
+            local from_ref=""
 
+            echo "--- Validating FROM uses ${expected_arg} in: $dockerfile" >&2
+
+            from_ref=$(extract_from_token "$dockerfile")
+            echo "Extracted FROM token: ${from_ref:-<empty>}" >&2
+            if [ -z "$from_ref" ]; then
+              echo "ERROR: No FROM line found in $dockerfile" >&2
+              exit 1
+            fi
+
+            if [ "$from_ref" != "$expected_arg" ]; then
+              echo "ERROR: Expected FROM to use $expected_arg in $dockerfile, got '${from_ref:-<empty>}'" >&2
+              exit 1
+            fi
+
+            echo "Validation passed: FROM uses $expected_arg" >&2
+          }
+
+          SANDBOX_LABEL=$(resolve_label_from_file "local/sandbox/Dockerfile")
+          check_from_uses_arg "local/sandbox-common/Dockerfile" '${BASE_IMAGE}'
+
+          echo "Final sandbox label: $SANDBOX_LABEL"
           echo "sandbox_label=$SANDBOX_LABEL" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -256,6 +308,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "=== Resolve image label (browser) ==="
+          echo "Parser binary: ${PARSER_BIN}"
+          if [ ! -x "$PARSER_BIN" ]; then
+            echo "ERROR: parser binary is missing or not executable: $PARSER_BIN" >&2
+            exit 1
+          fi
+
           resolve_label_from_file() {
             local dockerfile="$1"
             local from_line=""
@@ -263,13 +322,18 @@ jobs:
             local from_ref=""
             local label=""
 
+            echo "--- Resolving label for: $dockerfile" >&2
+
             from_line=$(grep -Eim1 '^[[:space:]]*FROM[[:space:]]' "$dockerfile" || true)
             if [ -z "$from_line" ]; then
+              echo "No FROM line found, defaulting label to latest" >&2
               echo "latest"
               return
             fi
+            echo "Matched FROM line: $from_line" >&2
 
             from_parsed=$(printf '%s\n' "$from_line" | "$PARSER_BIN")
+            echo "Parser output: $from_parsed" >&2
             from_ref=$(jq -r '
               first(
                 .[]
@@ -279,6 +343,7 @@ jobs:
                 | .[0]
               ) // empty
             ' <<< "$from_parsed")
+            echo "Extracted FROM token: ${from_ref:-<empty>}" >&2
 
             from_ref="${from_ref%@*}"
             if [[ "$from_ref" == *:* ]]; then
@@ -287,10 +352,13 @@ jobs:
               label="latest"
             fi
 
+            echo "Resolved label: $label" >&2
+
             printf '%s\n' "$label"
           }
 
           BROWSER_LABEL=$(resolve_label_from_file "local/sandbox-browser/Dockerfile")
+          echo "Final browser label: $BROWSER_LABEL"
           echo "browser_label=$BROWSER_LABEL" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v7
