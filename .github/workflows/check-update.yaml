@@ -31,6 +31,7 @@ jobs:
             --limit 1 \
             --json tagName \
             --jq '.[0].tagName')
+          echo "Upstream release: $RELEASE"
           echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
       - name: Get latest release
         id: get-release
@@ -111,7 +112,7 @@ jobs:
             OPENCLAW_INSTALL_DOCKER_CLI=1
             OPENCLAW_VARIANT=slim
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/lobster:bookworm-slim
+          tags: ghcr.io/${{ github.repository_owner }}/lobster:${{ needs.check-update.outputs.version }}-slim,ghcr.io/${{ github.repository_owner }}/lobster:latest-slim
 
   build:
     name: Build
