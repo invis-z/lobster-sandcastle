@@ -143,6 +143,54 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
+      - name: Setup Dockerfile Parser
+        id: setup-parser
+        uses: invis-z/lobster-sandcastle/.github/actions/setup-dockerfile-parser@active
+      - name: Resolve image labels from Dockerfiles
+        id: labels
+        shell: bash
+        env:
+          PARSER_BIN: ${{ steps.setup-parser.outputs.parser_bin }}
+        run: |
+          set -euo pipefail
+
+          resolve_label_from_file() {
+            local dockerfile="$1"
+            local from_line=""
+            local from_parsed=""
+            local from_ref=""
+            local label=""
+
+            from_line=$(grep -Eim1 '^[[:space:]]*FROM[[:space:]]' "$dockerfile" || true)
+            if [ -z "$from_line" ]; then
+              echo "latest"
+              return
+            fi
+
+            from_parsed=$(printf '%s\n' "$from_line" | "$PARSER_BIN")
+            from_ref=$(jq -r '
+              first(
+                .[]
+                | select((.value | ascii_downcase) == "from")
+                | [ .next? | recurse(if (type == "object" and has("next")) then .next else empty end) | .value? ]
+                | map(select(. != null and . != "" and (startswith("--") | not)))
+                | .[0]
+              ) // empty
+            ' <<< "$from_parsed")
+
+            from_ref="${from_ref%@*}"
+            if [[ "$from_ref" == *:* ]]; then
+              label="${from_ref##*:}"
+            else
+              label="latest"
+            fi
+
+            printf '%s\n' "$label"
+          }
+
+          SANDBOX_LABEL=$(resolve_label_from_file "local/sandbox/Dockerfile")
+
+          echo "sandbox_label=$SANDBOX_LABEL" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -153,7 +201,7 @@ jobs:
           platforms: linux/amd64, linux/arm64
           push: true
           cache-to: type=gha,mode=max
-          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:bookworm-slim
+          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:${{ steps.labels.outputs.sandbox_label }}
 
       - name: Build and push Sandbox Common
         uses: docker/build-push-action@v7
@@ -167,7 +215,7 @@ jobs:
             BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/lobster-sandcastle:${{ needs.pre-build.outputs.version }}
           push: true
           cache-from: type=gha
-          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-common:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-common:bookworm-slim
+          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-common:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-common:${{ steps.labels.outputs.sandbox_label }}
 
   build-sandbox-browser:
     name: Build Sandbox Browser
@@ -197,6 +245,53 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
+      - name: Setup Dockerfile Parser
+        id: setup-parser
+        uses: invis-z/lobster-sandcastle/.github/actions/setup-dockerfile-parser@active
+      - name: Resolve image label from Dockerfile
+        id: labels
+        shell: bash
+        env:
+          PARSER_BIN: ${{ steps.setup-parser.outputs.parser_bin }}
+        run: |
+          set -euo pipefail
+
+          resolve_label_from_file() {
+            local dockerfile="$1"
+            local from_line=""
+            local from_parsed=""
+            local from_ref=""
+            local label=""
+
+            from_line=$(grep -Eim1 '^[[:space:]]*FROM[[:space:]]' "$dockerfile" || true)
+            if [ -z "$from_line" ]; then
+              echo "latest"
+              return
+            fi
+
+            from_parsed=$(printf '%s\n' "$from_line" | "$PARSER_BIN")
+            from_ref=$(jq -r '
+              first(
+                .[]
+                | select((.value | ascii_downcase) == "from")
+                | [ .next? | recurse(if (type == "object" and has("next")) then .next else empty end) | .value? ]
+                | map(select(. != null and . != "" and (startswith("--") | not)))
+                | .[0]
+              ) // empty
+            ' <<< "$from_parsed")
+
+            from_ref="${from_ref%@*}"
+            if [[ "$from_ref" == *:* ]]; then
+              label="${from_ref##*:}"
+            else
+              label="latest"
+            fi
+
+            printf '%s\n' "$label"
+          }
+
+          BROWSER_LABEL=$(resolve_label_from_file "local/sandbox-browser/Dockerfile")
+          echo "browser_label=$BROWSER_LABEL" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -206,4 +301,4 @@ jobs:
           file: local/sandbox-browser/Dockerfile
           platforms: linux/amd64, linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-browser:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-browser:bookworm-slim
+          tags: ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-browser:${{ needs.pre-build.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster-sandcastle-browser:${{ steps.labels.outputs.browser_label }}
