@@ -123,6 +123,85 @@ jobs:
       version: ${{ needs.check-update.outputs.version }}
       commit: ${{ needs.refresh-dockerfiles.outputs.commit_sha }}
 
+  create-release:
+    name: Create Release
+    needs: [check-update, refresh-dockerfiles]
+    if: ${{ always() && needs.check-update.outputs.need_update == 'true' && needs.refresh-dockerfiles.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release for upstream version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ needs.check-update.outputs.version }}"
+
+          echo "=== Creating Release ==="
+          echo "VERSION: $VERSION"
+          echo "REPOSITORY: ${{ github.repository }}"
+
+          RELEASE_EXISTS=false
+          if gh release view "$VERSION" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+          echo "Release exists: $RELEASE_EXISTS"
+
+          TARGET_SHA="${{ needs.refresh-dockerfiles.outputs.commit_sha }}"
+          if [ -z "$TARGET_SHA" ] || [ "$TARGET_SHA" = "null" ]; then
+            echo "No commit created during refresh; resolving active branch head for release target."
+            TARGET_SHA=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${{ github.repository }}/branches/active" \
+              --jq '.commit.sha')
+          fi
+
+          if [ -z "$TARGET_SHA" ] || [ "$TARGET_SHA" = "null" ]; then
+            echo "ERROR: failed to resolve release target SHA." >&2
+            exit 1
+          fi
+
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "Updating existing release tag $VERSION to target: $TARGET_SHA"
+            if gh api --method PATCH \
+              "/repos/${{ github.repository }}/git/refs/tags/$VERSION" \
+              -f sha="$TARGET_SHA" \
+              -F force=true > /dev/null 2>&1; then
+              echo "Tag ref updated via PATCH"
+            else
+              echo "PATCH tag ref failed, recreating tag ref"
+              gh api --method DELETE \
+                "/repos/${{ github.repository }}/git/refs/tags/$VERSION" \
+                > /dev/null 2>&1 || true
+              gh api --method POST \
+                "/repos/${{ github.repository }}/git/refs" \
+                -f ref="refs/tags/$VERSION" \
+                -f sha="$TARGET_SHA" \
+                > /dev/null
+              echo "Tag ref recreated"
+            fi
+
+            gh release edit "$VERSION" \
+              --repo "${{ github.repository }}" \
+              --title "$VERSION" \
+              --notes "Synced from upstream $VERSION"
+
+            echo "Release updated successfully"
+          else
+            echo "Creating release $VERSION at target: $TARGET_SHA"
+            gh release create "$VERSION" \
+              --repo "${{ github.repository }}" \
+              --target "$TARGET_SHA" \
+              --title "$VERSION" \
+              --notes "Synced from upstream $VERSION" \
+              --latest
+
+            echo "Release created successfully"
+          fi
+
   clean-history:
     name: Clean History
     needs: check-update
