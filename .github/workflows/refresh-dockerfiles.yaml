@@ -176,15 +176,10 @@ jobs:
       - name: Collect Images with Changed Dependencies
         id: collect-changed
         env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
-          VERSION: ${{ inputs.version }}
           CHANGED_FILES_JSON: ${{ steps.get-changed-files.outputs.changed_files_json }}
           COPY_CHECK_IMAGES: ${{ steps.copy-check-list.outputs.images }}
         run: |
           echo "=== Collecting Images with Changed Dependencies ==="
-          echo "UPSTREAM_REPO: $UPSTREAM_REPO"
-          echo "VERSION: $VERSION"
           echo "COPY_CHECK_IMAGES: $COPY_CHECK_IMAGES"
           echo "CHANGED_FILES_JSON: $CHANGED_FILES_JSON"
           
@@ -237,35 +232,6 @@ jobs:
               fi
             done
           done <<< "$(jq -r '.[]' <<< "$COPY_CHECK_IMAGES")"
-
-          echo ""
-          echo "=== Applying Dockerfile Updates for Changed Images ==="
-          # Apply Dockerfile updates for images changed via COPY/ADD dependencies.
-          while IFS= read -r image; do
-            [ -z "$image" ] && continue
-            echo "Updating Dockerfile for image: $image"
-            DOCKERFILE="Dockerfile.${image}"
-            UPSTREAM_FILE="upstream/${DOCKERFILE}"
-            LOCAL_FILE="local/${image}/Dockerfile"
-            
-            echo "  UPSTREAM_FILE: $UPSTREAM_FILE"
-            echo "  LOCAL_FILE: $LOCAL_FILE"
-
-            if [ ! -f "$UPSTREAM_FILE" ]; then
-              echo "  Downloading from upstream..."
-              gh api \
-                -H "Accept: application/vnd.github.v3.raw" \
-                "/repos/$UPSTREAM_REPO/contents/${DOCKERFILE}?ref=$VERSION" \
-                > "$UPSTREAM_FILE"
-              echo "  ✓ Downloaded"
-            else
-              echo "  Using cached upstream file"
-            fi
-
-            mkdir -p "local/${image}"
-            cp "$UPSTREAM_FILE" "$LOCAL_FILE"
-            echo "  ✓ Copied to local"
-          done <<< "$CHANGED_IMAGES"
 
           echo ""
           echo "Final CHANGED_IMAGES output:"
