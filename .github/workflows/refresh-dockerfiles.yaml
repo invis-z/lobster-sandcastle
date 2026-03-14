@@ -68,15 +68,25 @@ jobs:
           CHANGED_FILES_JSON='[]'
           if [ -n "$LOCAL_VERSION" ] && [ "$LOCAL_VERSION" != "null" ]; then
             echo "Comparing $LOCAL_VERSION...$VERSION in $UPSTREAM_REPO"
+            COMPARE_FAILED=0
             CHANGED_FILES_JSON=$(gh api \
               "/repos/$UPSTREAM_REPO/compare/${LOCAL_VERSION}...${VERSION}" \
-              --jq '[.files[].filename]')
-            echo "Changed files count: $(echo "$CHANGED_FILES_JSON" | jq 'length')"
-            echo "Changed files: $(echo "$CHANGED_FILES_JSON" | jq -r '.[]')"
+              --jq '[.files[].filename]') || COMPARE_FAILED=1
+
+            if [ "$COMPARE_FAILED" -eq 1 ]; then
+              if jq -e '.status == 404 or .status == "404"' <<< "$CHANGED_FILES_JSON" > /dev/null 2>&1; then
+                echo "Compare returned 404, normalizing changed files to []"
+                CHANGED_FILES_JSON='[]'
+              else
+                echo "Compare failed with non-404 response: $CHANGED_FILES_JSON" >&2
+                exit 1
+              fi
+            fi
           else
             echo "No local version found, treating all files as changed."
           fi
 
+          echo "Final CHANGED_FILES_JSON: $CHANGED_FILES_JSON"
           echo "changed_files_json=$CHANGED_FILES_JSON" >> "$GITHUB_OUTPUT"
           echo "✓ Changed files collected"
 
@@ -179,6 +189,8 @@ jobs:
           echo "CHANGED_FILES_JSON: $CHANGED_FILES_JSON"
           
           CHANGED_IMAGES=""
+          HAS_CHANGED_LIST=$(jq -r 'length > 0' <<< "$CHANGED_FILES_JSON")
+          echo "HAS_CHANGED_LIST: $HAS_CHANGED_LIST"
           
           # Check COPY/ADD dependencies only for images in the check list
           while IFS= read -r image; do
@@ -201,6 +213,12 @@ jobs:
             
             echo "  Cached sources:"
             echo "$COPY_SOURCES" | sed 's/^/    /'
+
+            if [ "$HAS_CHANGED_LIST" = "false" ]; then
+              echo "  No scoped changed file list available; treating cached COPY/ADD dependencies as changed."
+              CHANGED_IMAGES="${CHANGED_IMAGES}${image}"$'\n'
+              continue
+            fi
 
             for src in $COPY_SOURCES; do
               [ -z "$src" ] && continue
