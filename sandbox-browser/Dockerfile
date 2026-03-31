@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+FROM debian:bookworm-slim@sha256:98f4b71de414932439ac6ac690d7060df1f27161073c5036a7553723881bffbe
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,6 +14,7 @@ RUN --mount=type=cache,id=openclaw-sandbox-bookworm-apt-cache,target=/var/cache/
     chromium \
     curl \
     fonts-liberation \
+    fonts-noto-cjk \
     fonts-noto-color-emoji \
     git \
     jq \
