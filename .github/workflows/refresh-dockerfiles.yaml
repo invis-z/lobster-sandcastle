@@ -29,7 +29,7 @@ jobs:
       commit_sha: ${{ steps.commit-and-push.outputs.commit_sha }}
     steps:
       - name: Checkout Local
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: local
 
