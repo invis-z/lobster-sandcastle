@@ -77,7 +77,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout Source Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.UPSTREAM_REPO }}
           ref: ${{ needs.check-update.outputs.version }}

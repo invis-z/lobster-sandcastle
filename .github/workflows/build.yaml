@@ -125,12 +125,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout Local
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit != '' && inputs.commit || needs.decide.outputs.local_ref }}
           path: local
       - name: Checkout Source Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.UPSTREAM_REPO }}
           ref: ${{ needs.pre-build.outputs.version }}
@@ -279,12 +279,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout Local
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit != '' && inputs.commit || needs.decide.outputs.local_ref }}
           path: local
       - name: Checkout Source Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.UPSTREAM_REPO }}
           ref: ${{ needs.pre-build.outputs.version }}
