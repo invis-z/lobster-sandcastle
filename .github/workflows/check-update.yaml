@@ -98,7 +98,7 @@ jobs:
           context: upstream
           platforms: linux/amd64, linux/arm64
           build-args: |
-            OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=4096
+            OPENCLAW_DOCKER_BUILD_NODE_OPTIONS="--max-old-space-size=4096"
             OPENCLAW_INSTALL_DOCKER_CLI=1
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/lobster:${{ needs.check-update.outputs.version }},ghcr.io/${{ github.repository_owner }}/lobster:latest
@@ -110,7 +110,7 @@ jobs:
           context: upstream
           platforms: linux/amd64, linux/arm64
           build-args: |
-            OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=4096
+            OPENCLAW_DOCKER_BUILD_NODE_OPTIONS="--max-old-space-size=4096"
             OPENCLAW_INSTALL_DOCKER_CLI=1
             OPENCLAW_VARIANT=slim
           push: true
