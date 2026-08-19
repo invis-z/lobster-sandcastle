@@ -24,13 +24,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE=$(gh release list \
+          RELEASE=$(gh release view \
             --repo "${{ vars.UPSTREAM_REPO }}" \
-            --exclude-drafts \
-            --exclude-pre-releases \
-            --limit 1 \
             --json tagName \
-            --jq '.[0].tagName')
+            --jq '.tagName')
           echo "Upstream release: $RELEASE"
           echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
       - name: Get latest release
@@ -39,13 +36,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE=$(gh release list \
+          RELEASE=$(gh release view \
             --repo "${{ github.repository }}" \
-            --exclude-drafts \
-            --exclude-pre-releases \
-            --limit 1 \
             --json tagName \
-            --jq '.[0].tagName // empty')
+            --jq '.tagName // empty')
           if [ -z "$RELEASE" ]; then
             echo "No local release found, will treat all files as changed."
           else
